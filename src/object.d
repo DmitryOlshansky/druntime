@@ -10,6 +10,8 @@
 
 module object;
 
+import core.internal.traits;
+
 private
 {
     extern (C) Object _d_newclass(const TypeInfo_Class ci);
@@ -2810,14 +2812,21 @@ version(unittest) unittest
 void destroy(T)(ref T obj) if (is(T == struct))
 {
     _destructRecurse(obj);
-    () @trusted {
-        auto buf = (cast(ubyte*) &obj)[0 .. T.sizeof];
-        auto init = cast(ubyte[])typeid(T).initializer();
-        if (init.ptr is null) // null ptr means initialize to 0s
-            buf[] = 0;
-        else
-            buf[] = init[];
-    } ();
+    static if(!hasElaborateCopyConstructor!T && !hasElaborateAssign!T)
+    {
+        obj = T.init;
+    }
+    else
+    {
+        () @trusted {
+            auto buf = (cast(ubyte*) &obj)[0 .. T.sizeof];
+            auto init = cast(ubyte[])typeid(T).initializer();
+            if (init.ptr is null) // null ptr means initialize to 0s
+                buf[] = 0;
+            else
+                buf[] = init[];
+        } ();
+    }
 }
 
 version(unittest) nothrow @safe @nogc unittest

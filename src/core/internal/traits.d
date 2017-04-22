@@ -187,3 +187,23 @@ template hasElaborateCopyConstructor(T...)
     else
         enum bool hasElaborateCopyConstructor = false;
 }
+
+template hasElaborateAssign(T...)
+{
+    static if (is(T[0]))
+        alias S = T[0];
+    else
+        alias S = typeof(T[0]);
+
+    static if (is(S : E[n], E, size_t n) && S.length)
+    {
+        enum bool hasElaborateAssign = hasElaborateAssign!E;
+    }
+    else static if (is(S == struct))
+    {
+        enum hasElaborateAssign = __traits(hasMember, S, "opAssign")
+            || anySatisfy!(.hasElaborateAssign, S.tupleof);
+    }
+    else
+        enum bool hasElaborateAssign = false;
+}

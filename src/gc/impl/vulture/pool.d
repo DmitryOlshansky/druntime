@@ -1,9 +1,18 @@
 module gc.impl.vulture.pool;
 
 static import core.memory;
+import core.bitop;
 import core.internal.spinlock;
 import gc.os;
 import common = rt.util.container.common;
+
+package:
+
+enum
+{
+    PAGESIZE = 4096,
+    CHUNKSIZE = 256*PAGESIZE
+}
 
 alias BlkInfo = core.memory.GC.BlkInfo;
 alias BlkAttr = core.memory.GC.BlkAttr;
@@ -14,9 +23,50 @@ enum PoolType {
     HUGE = 2   // 8M+
 }
 
+enum SIZE_CLASSES = 8; // 16 - 2^^4 to 2K - 2^^11
+
+ubyte sizeClassOf(size_t size) nothrow
+{
+    if (size <= 16) return 4;
+    ubyte notPow2 = (size & (size-1)) != 0;
+    return cast(ubyte)(notPow2 + bsr(size));
+}
+
+struct ThreadCache
+{
+nothrow:
+    struct AllocCache
+    {
+        Pool* pool;     // the pool where block was acquired
+        uint objOffset; // number of the first object in freeBits slice
+        uint freeBits;  // freebits with up to 32 objects
+    }
+
+    AllocCache[SIZE_CLASSES*2] cache; // per size class per SCAN/NO_SCAN
+
+    BlkInfo allocate(ubyte sclass, uint bits)
+    {
+        return BlkInfo.init; // TODO
+    }
+
+    void populate(ubyte sclass, bool noScan, Pool* pool)
+    {
+        // TODO
+    }
+}
+
+
+unittest
+{
+    assert(sizeClassOf(0) == 4);
+    assert(sizeClassOf(15) == 4);
+    assert(sizeClassOf(16) == 4);
+    assert(sizeClassOf(17) == 5);
+    assert(sizeClassOf(2048) == 11);
+}
+
 struct Pool
 {
-package:
     union Impl
     {
         SmallPool small;
@@ -27,25 +77,59 @@ package:
     PoolType type; // type of pool (immutable)
     bool isFree;   // if this pool is completely free
     bool noScan;   // if objects of this pool have no pointers (immutable)
-    ubyte shiftBy; // granularity, expressed in shift amount
-    void* minAddr, maxAddr; // extent of the pool in virtual memory
+    ubyte shiftBy; // granularity, expressed in shift amount (immutable)
+    void* minAddr, maxAddr; // extent of the pool in virtual memory (immutable)
     Impl impl; // concrete pool details
-
+    void* mappedAddr; // real start of the mapping (immutable)
+    size_t mappedSize; // real size of the mapping (immutable)
 nothrow:
+
+    @property ref small(){ return impl.small; }
+    @property ref large(){ return impl.large; }
+    @property ref huge(){ return impl.huge; }
+    
+    void initialize(size_t size)
+    {
+        _lock = shared(SpinLock)(SpinLock.Contention.medium);
+        isFree = false;
+        size_t CHUNKSIZE = (size + CHUNKSIZE-1) & ~(CHUNKSIZE-1);
+        minAddr = cast(byte *)os_mem_map(CHUNKSIZE + CHUNKSIZE);
+        mappedSize = CHUNKSIZE + CHUNKSIZE;
+        mappedAddr = minAddr;
+        if (cast(size_t)minAddr & (CHUNKSIZE-1))
+        {
+            size_t padding = CHUNKSIZE - (cast(size_t)minAddr & (CHUNKSIZE-1));
+            minAddr += padding;
+        }
+        else
+            CHUNKSIZE += CHUNKSIZE;
+        maxAddr = minAddr + CHUNKSIZE;
+    }
+
     void Dtor()
     {
-
+        int r = os_mem_unmap(mappedAddr, mappedSize);
+        assert(r == 0);
     }
 
     void reset()
     {
-        int r = os_mem_reset(minAddr, maxAddr-minAddr);
+        // only need to reset the used portion of mapping
+        int r = os_mem_reset(minAddr, maxAddr - minAddr);
         assert(r == 0);
     }
 
     void lock(){ _lock.lock(); }
+
     void unlock(){ _lock.unlock(); }
+
 //TODO: implement the below
+    
+    BlkInfo allocate(size_t size, uint bits)
+    {
+        return BlkInfo.init;
+    }
+
     uint getAttr(void* p){ return 0; }
     
     uint setAttr(void* p, uint attrs){ return 0; }
@@ -103,14 +187,18 @@ struct LargePool
 /// respective OS primitives. Granularity is 1MB.
 struct HugePool
 {
-
+    bool mark;
+    bool finals;
+    bool structFinals;
+    bool appendable;
 }
 
-Pool* newSmallPool(size_t sizeClass, bool noScan) nothrow
+Pool* newSmallPool(ubyte sizeClass, bool noScan) nothrow
 {
     Pool* p = cast(Pool*)common.xmalloc(Pool.sizeof);
     p.type = PoolType.SMALL;
     p.noScan = noScan;
+    p.shiftBy = sizeClass;
     //TODO: proper init
     return p;
 }
@@ -119,6 +207,7 @@ Pool* newLargePool(size_t size, bool noScan) nothrow
 {
     Pool* p = cast(Pool*)common.xmalloc(Pool.sizeof);
     p.type = PoolType.LARGE;
+    p.noScan = noScan;
     p.shiftBy = 12;
     //TODO: proper init
     return p;
@@ -130,6 +219,9 @@ Pool* newHugePool(size_t size, uint bits) nothrow
     p.type = PoolType.HUGE;
     p.shiftBy = 20;
     p.noScan = ((bits & BlkAttr.NO_SCAN) != 0);
-    //TODO: proper init
+    p.huge.finals = ((bits & BlkAttr.FINALIZE) != 0);
+    p.huge.structFinals = ((bits & BlkAttr.STRUCTFINAL) != 0);
+    p.huge.appendable = ((bits & BlkAttr.APPENDABLE) != 0);
+    p.initialize(size);
     return p;
 }

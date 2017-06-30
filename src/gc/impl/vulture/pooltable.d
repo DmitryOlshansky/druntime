@@ -9,11 +9,6 @@ import gc.impl.vulture.pool;
 import rt.util.container.hashtab;
 static import common = rt.util.container.common;
 
-enum
-{
-    PAGESIZE = 4096,
-    CHUNKSIZE = 256*PAGESIZE
-}
 
 struct PoolTable
 {

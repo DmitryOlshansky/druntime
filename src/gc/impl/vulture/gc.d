@@ -27,13 +27,14 @@ class VultureGC : GC
     auto poolTable = PoolTable(INITIAL_POOLMAP_SIZE);
     size_t enabled = 1;
     bool _inFinalizer = false;
+    size_t[2] numLargePools; // keep track of pools with SCAN/NO_SCAN attr
 
+    static ThreadCache tcache;
     /*
      *
      */
     void Dtor()
     {
-        metaLock.lock();
         poolTable.Dtor();
     }
 
@@ -135,8 +136,13 @@ class VultureGC : GC
      */
     BlkInfo qalloc(size_t size, uint bits, const TypeInfo ti) nothrow
     {
+        // Check TypeInfo "should scan" bit
+        if (ti && !(ti.flags() & 1)) bits |= BlkAttr.NO_SCAN;
+        // Small alloc goes to TLS cache first so no locking upfront
+        if (size <= MAXSMALL) return smallAlloc(size, bits);
         metaLock.lock();
-        return qallocWithLock(size, bits, ti);
+        if(size <= 8 * CHUNKSIZE) return largeAlloc(size, bits);
+        else return hugeAlloc(size, bits);
     }
 
     /*
@@ -151,23 +157,86 @@ class VultureGC : GC
     {
         // Check TypeInfo "should scan" bit
         if (ti && !(ti.flags() & 1)) bits |= BlkAttr.NO_SCAN;
-        if (size <= MAXSMALL) return smallAlloc(size, bits);
-        else if(size <= 8 * CHUNKSIZE) return largeAlloc(size, bits);
+        if (size <= MAXSMALL)
+        {
+            // Small alloc goes to TLS cache first so no locking upfront
+            metaLock.unlock();
+            return smallAlloc(size, bits);
+        }
+        if(size <= 8 * CHUNKSIZE) return largeAlloc(size, bits);
         else return hugeAlloc(size, bits);
     }
 
     BlkInfo smallAlloc(size_t size, uint bits) nothrow
     {
-        return BlkInfo.init;
+        ubyte sclass = sizeClassOf(size);
+        BlkInfo blk = tcache.allocate(sclass, bits);
+        if (blk.base != null) return blk;
+        // ThreadCache for this allocation is empty, let's populate it
+        bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
+        metaLock.lock();
+        foreach (i; 0..poolTable.length)
+        {
+            auto p = poolTable[i];
+            // Quick check of immutable properties w/o locking
+            if (p.type == PoolType.SMALL && p.noScan == noScan)
+            {
+                p.lock();
+                scope(exit) p.unlock();
+                if (p.small.freeObjects > 0)
+                {
+                    metaLock.unlock();
+                    tcache.populate(sclass, noScan, p);
+                    return tcache.allocate(sclass, bits);
+                }
+            }
+        }
+        // Time to create a new pool
+        // TODO: maybe GC
+        metaLock.unlock();
+        auto pool = newSmallPool(sclass, noScan);
+        tcache.populate(sclass, noScan, pool);
+        metaLock.lock();
+        poolTable.insert(pool);
+        metaLock.unlock();
+        return tcache.allocate(sclass, bits);
     }
 
     BlkInfo largeAlloc(size_t size, uint bits) nothrow
     {
-        return BlkInfo.init;
+        bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
+        metaLock.lock();
+        foreach(i; 0..poolTable.length)
+        {
+            auto p = poolTable[i];
+            // Quick check of immutable properties w/o locking
+            if (p.type == PoolType.LARGE && p.noScan == noScan)
+            {
+                p.lock();
+                scope(exit) p.unlock();
+                if (p.large.largestFree >= size)
+                {
+                    metaLock.unlock();
+                    return p.allocate(size, bits);
+                }
+            }
+        }
+        // TODO: maybe GC
+        // needs meta lock for numLargePools
+        size_t poolSize = (numLargePools[noScan]+1)*16*CHUNKSIZE;
+        numLargePools[noScan]++;
+        metaLock.unlock();
+        auto pool = newLargePool(poolSize, noScan);
+        auto blk = pool.allocate(size, bits); // no locking, nobody can see it
+        metaLock.lock();
+        poolTable.insert(pool);
+        metaLock.unlock();
+        return blk;
     }
 
     BlkInfo hugeAlloc(size_t size, uint bits) nothrow
     {
+        // TODO: maybe GC
         // No locking any pools whatsoever
         Pool* p = newHugePool(size, bits);
         metaLock.lock();

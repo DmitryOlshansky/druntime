@@ -38,35 +38,21 @@ else version (Posix)
     else version (WatchOS)
         version = Darwin;
 
-    import core.sys.posix.sys.mman;
-    version (FreeBSD) import core.sys.freebsd.sys.mman : MAP_ANON;
-    version (NetBSD) import core.sys.netbsd.sys.mman : MAP_ANON;
-    version (CRuntime_Glibc) import core.sys.linux.sys.mman : MAP_ANON;
-    version (Darwin) import core.sys.darwin.sys.mman : MAP_ANON;
-    import core.stdc.stdlib;
+    //import core.sys.posix.sys.mman;
+    version (FreeBSD) import core.sys.freebsd.sys.mman;
+    version (NetBSD) import core.sys.netbsd.sys.mman;
+    version (CRuntime_Glibc) import core.sys.linux.sys.mman;
+    version (Darwin) import core.sys.darwin.sys.mman;
 
-    //version = GC_Use_Alloc_MMap;
+    import core.stdc.stdlib;
 }
 else
 {
     import core.stdc.stdlib;
 
-    //version = GC_Use_Alloc_Malloc;
 }
 
-/+
-static if(is(typeof(VirtualAlloc)))
-    version = GC_Use_Alloc_Win32;
-else static if (is(typeof(mmap)))
-    version = GC_Use_Alloc_MMap;
-else static if (is(typeof(valloc)))
-    version = GC_Use_Alloc_Valloc;
-else static if (is(typeof(malloc)))
-    version = GC_Use_Alloc_Malloc;
-else static assert(false, "No supported allocation methods available.");
-+/
-
-static if (is(typeof(VirtualAlloc))) // version (GC_Use_Alloc_Win32)
+static if (is(typeof(VirtualAlloc)))
 {
     /**
      * Map memory.
@@ -77,6 +63,16 @@ static if (is(typeof(VirtualAlloc))) // version (GC_Use_Alloc_Win32)
                 PAGE_READWRITE);
     }
 
+    /**
+     * Mark memory allocated with os_mem_map as free to reuse by OS.
+     * Returns:
+     *      0       success
+     *      !=0     failure
+     */
+    int os_mem_reset(void *base, size_t nbytes) nothrow
+    {
+        return VirtualAlloc(null, nbytes, MEM_RESET, PAGE_READWRITE) == NULL;
+    }
 
     /**
      * Unmap memory allocated with os_mem_map().
@@ -89,7 +85,7 @@ static if (is(typeof(VirtualAlloc))) // version (GC_Use_Alloc_Win32)
         return cast(int)(VirtualFree(base, 0, MEM_RELEASE) == 0);
     }
 }
-else static if (is(typeof(mmap)))  // else version (GC_Use_Alloc_MMap)
+else static if (is(typeof(mmap)))
 {
     void *os_mem_map(size_t nbytes) nothrow
     {   void *p;
@@ -98,19 +94,34 @@ else static if (is(typeof(mmap)))  // else version (GC_Use_Alloc_MMap)
         return (p == MAP_FAILED) ? null : p;
     }
 
+    int os_mem_reset(void *base, size_t nbytes) nothrow
+    {
+        version(linux)
+            return madvise(base, nbytes, MADV_DONTNEED);
+        else version(FreeBSD)
+            return madvise(base, nbytes, MADV_FREE);
+        else version(Darwin)
+            return madvise(base, nbytes, MADV_FREE);
+        else
+            static assert(false, "Unsupported OS");
+    }
 
     int os_mem_unmap(void *base, size_t nbytes) nothrow
     {
         return munmap(base, nbytes);
     }
 }
-else static if (is(typeof(valloc))) // else version (GC_Use_Alloc_Valloc)
+else static if (is(typeof(valloc)))
 {
     void *os_mem_map(size_t nbytes) nothrow
     {
         return valloc(nbytes);
     }
 
+    int os_mem_reset(void *base, size_t nbytes) nothrow
+    {
+        return 0;
+    }
 
     int os_mem_unmap(void *base, size_t nbytes) nothrow
     {
@@ -118,7 +129,7 @@ else static if (is(typeof(valloc))) // else version (GC_Use_Alloc_Valloc)
         return 0;
     }
 }
-else static if (is(typeof(malloc))) // else version (GC_Use_Alloc_Malloc)
+else static if (is(typeof(malloc)))
 {
     // NOTE: This assumes malloc granularity is at least (void*).sizeof.  If
     //       (req_size + PAGESIZE) is allocated, and the pointer is rounded up
@@ -140,6 +151,10 @@ else static if (is(typeof(malloc))) // else version (GC_Use_Alloc_Malloc)
         return q;
     }
 
+    int os_mem_reset(void *base, size_t nbytes) nothrow
+    {
+        return 0;
+    }
 
     int os_mem_unmap(void *base, size_t nbytes) nothrow
     {

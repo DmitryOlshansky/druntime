@@ -3,7 +3,9 @@ module gc.impl.vulture.pool;
 static import core.memory;
 import core.bitop;
 import core.internal.spinlock;
+import core.stdc.string;
 import gc.os;
+import gc.impl.vulture.bits;
 import common = rt.util.container.common;
 
 package:
@@ -11,7 +13,9 @@ package:
 enum
 {
     PAGESIZE = 4096,
-    CHUNKSIZE = 256*PAGESIZE
+    CHUNKSIZE = 256 * PAGESIZE,
+    MAXSMALL = 2048,
+    MAXLARGE = 8 * CHUNKSIZE
 }
 
 alias BlkInfo = core.memory.GC.BlkInfo;
@@ -23,13 +27,33 @@ enum PoolType {
     HUGE = 2   // 8M+
 }
 
-enum SIZE_CLASSES = 8; // 16 - 2^^4 to 2K - 2^^11
+enum { // measured as powers of 2
+    FIRST_SIZE_CLASS = 4,
+    LAST_SIZE_CLASS = 11,
+    SIZE_CLASSES = LAST_SIZE_CLASS - FIRST_SIZE_CLASS
+}
+
+// Buckets for Large pool
+enum BUCKETS = (toPow2(MAXLARGE) - 12 + 3) / 4;
+
+ubyte toPow2(size_t size) nothrow pure
+{
+    ubyte notPow2 = (size & (size-1)) != 0;
+    return cast(ubyte)(notPow2 + bsr(size));
+}
 
 ubyte sizeClassOf(size_t size) nothrow
 {
     if (size <= 16) return 4;
-    ubyte notPow2 = (size & (size-1)) != 0;
-    return cast(ubyte)(notPow2 + bsr(size));
+    return toPow2(size);
+}
+
+ubyte bucketOf(size_t size) nothrow
+{
+    ubyte pow2 = toPow2(size);
+    assert(pow2 >= 12); // 4K+ in large pool
+    ubyte bucket = cast(ubyte)((pow2 - 12) / 4);
+    return bucket > BUCKETS-1 ? BUCKETS-1 : bucket;
 }
 
 struct ThreadCache
@@ -50,6 +74,11 @@ nothrow:
     }
 
     void populate(ubyte sclass, bool noScan, Pool* pool)
+    {
+        // TODO
+    }
+
+    void release()
     {
         // TODO
     }
@@ -124,11 +153,6 @@ nothrow:
     void unlock(){ _lock.unlock(); }
 
 //TODO: implement the below
-    
-    BlkInfo allocate(size_t size, uint bits)
-    {
-        return BlkInfo.init;
-    }
 
     uint getAttr(void* p){ return 0; }
     
@@ -172,6 +196,7 @@ nothrow:
 /// Memory is allocated in bulk - 32 objects at a time.
 struct SmallPool
 {
+    uint freeObjects;
 
 }
 
@@ -179,7 +204,23 @@ struct SmallPool
 /// by size ranges. Granularity is 4K.
 struct LargePool
 {
+    uint largestFreeEstimate; // strictly >= largest free block
+    uint pages; // number of pages in this pool
+    uint[BUCKETS] freeLists; // index of the first free run
+    // offset serves double duty
+    // when pages are free it contains next in a free list
+    // else it is filled with offset of start of the object
+    uint* offsetTable; // one uint per page
+    // size of an object or a run of free pages
+    uint* sizeTable; // one uint per page
+    BitArray markbits;
+    BitArray freebits;
+    NibbleArray attrs;
 
+    BlkInfo allocate(size_t size, uint bits) nothrow
+    {
+        return BlkInfo.init;
+    }
 }
 
 /// A "pool" that represents single huge allocation.
@@ -199,6 +240,7 @@ Pool* newSmallPool(ubyte sizeClass, bool noScan) nothrow
     p.type = PoolType.SMALL;
     p.noScan = noScan;
     p.shiftBy = sizeClass;
+    p.initialize((sizeClass-FIRST_SIZE_CLASS+1) * CHUNKSIZE);
     //TODO: proper init
     return p;
 }
@@ -209,7 +251,17 @@ Pool* newLargePool(size_t size, bool noScan) nothrow
     p.type = PoolType.LARGE;
     p.noScan = noScan;
     p.shiftBy = 12;
-    //TODO: proper init
+    p.initialize(size);
+    p.large.largestFreeEstimate = cast(uint)(p.maxAddr - p.minAddr);
+    p.large.pages = cast(uint)(p.maxAddr - p.minAddr) / PAGESIZE;
+    p.large.freeLists[] = uint.max;
+    p.large.offsetTable = cast(uint*)common.xmalloc(uint.sizeof * p.large.pages);
+    p.large.sizeTable = cast(uint*)common.xmalloc(uint.sizeof * p.large.pages);
+
+    // setup free lists as one big chunk of highest bucket
+    p.large.sizeTable[0] = p.large.largestFreeEstimate;
+    p.large.offsetTable[0] = uint.max;
+    p.large.freeLists[BUCKETS-1] = 0;
     return p;
 }
 

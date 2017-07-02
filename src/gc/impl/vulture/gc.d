@@ -11,8 +11,14 @@ import rt.util.container.treap;
 alias Stats = core.memory.GC.Stats;
 
 enum {
-    INITIAL_POOLMAP_SIZE = 32,
-    MAXSMALL = 2048
+    INITIAL_POOLMAP_SIZE = 32,    
+}
+
+static ThreadCache tcache;
+
+static ~this()
+{
+    tcache.release();
 }
 
 class VultureGC : GC
@@ -29,7 +35,6 @@ class VultureGC : GC
     bool _inFinalizer = false;
     size_t[2] numLargePools; // keep track of pools with SCAN/NO_SCAN attr
 
-    static ThreadCache tcache;
     /*
      *
      */
@@ -141,7 +146,7 @@ class VultureGC : GC
         // Small alloc goes to TLS cache first so no locking upfront
         if (size <= MAXSMALL) return smallAlloc(size, bits);
         metaLock.lock();
-        if(size <= 8 * CHUNKSIZE) return largeAlloc(size, bits);
+        if(size <= MAXLARGE) return largeAlloc(size, bits);
         else return hugeAlloc(size, bits);
     }
 
@@ -213,11 +218,14 @@ class VultureGC : GC
             if (p.type == PoolType.LARGE && p.noScan == noScan)
             {
                 p.lock();
-                scope(exit) p.unlock();
-                if (p.large.largestFree >= size)
+                if (p.large.largestFreeEstimate >= size)
                 {
                     metaLock.unlock();
-                    return p.allocate(size, bits);
+                    auto blk = p.large.allocate(size, bits);
+                    p.unlock();
+                    if (blk.base) return blk;
+                    // estimate was wrong, continue
+                    metaLock.lock();
                 }
             }
         }
@@ -227,7 +235,7 @@ class VultureGC : GC
         numLargePools[noScan]++;
         metaLock.unlock();
         auto pool = newLargePool(poolSize, noScan);
-        auto blk = pool.allocate(size, bits); // no locking, nobody can see it
+        auto blk = pool.large.allocate(size, bits); // no locking, nobody can see it
         metaLock.lock();
         poolTable.insert(pool);
         metaLock.unlock();

@@ -266,6 +266,7 @@ SRCS=\
 	src\gc\proxy.d \
 	src\gc\impl\conservative\gc.d \
 	src\gc\impl\manual\gc.d \
+	src\gc\impl\vulture\bits.d \
 	src\gc\impl\vulture\gc.d \
 	src\gc\impl\vulture\pool.d \
 	src\gc\impl\vulture\pooltable.d \

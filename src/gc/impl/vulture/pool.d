@@ -36,6 +36,34 @@ enum { // measured as powers of 2
 // Buckets for Large pool
 enum BUCKETS = (toPow2(MAXLARGE) - 12 + 3) / 4;
 
+enum NibbleAttr : ubyte {
+    FINALIZE = 0x1,
+    APPENDABLE = 0x2,
+    NO_INTERIOR = 0x4,
+    STRUCTFINAL = 0x8
+}
+
+uint attrFromNibble(ubyte nibble, bool noScan) nothrow pure
+{
+    uint attr;
+    if (nibble & NibbleAttr.FINALIZE) attr |= BlkAttr.FINALIZE;
+    if (nibble & NibbleAttr.APPENDABLE) attr |= BlkAttr.APPENDABLE;
+    if (nibble & NibbleAttr.NO_INTERIOR) attr |= BlkAttr.NO_INTERIOR;
+    if (nibble & NibbleAttr.STRUCTFINAL) attr |= BlkAttr.STRUCTFINAL;
+    if (noScan) attr |= BlkAttr.NO_SCAN;
+    return attr;
+}
+
+ubyte attrToNibble(uint attr) nothrow pure
+{
+    ubyte nibble;
+    if (attr & BlkAttr.FINALIZE) nibble |= NibbleAttr.FINALIZE;
+    if (attr & BlkAttr.APPENDABLE) nibble |= NibbleAttr.APPENDABLE;
+    if (attr & BlkAttr.NO_INTERIOR) nibble |= NibbleAttr.NO_INTERIOR;
+    if (attr & BlkAttr.STRUCTFINAL) nibble |= BlkAttr.STRUCTFINAL;
+    return nibble;
+}
+
 ubyte toPow2(size_t size) nothrow pure
 {
     ubyte notPow2 = (size & (size-1)) != 0;
@@ -94,6 +122,45 @@ unittest
     assert(sizeClassOf(2048) == 11);
 }
 
+
+/// Segregated pool with a single size class.
+/// Memory is allocated in bulk - 32 objects at a time.
+struct SmallPool
+{
+    uint freeObjects;
+
+}
+
+/// A set of pages organized into a bunch of free lists
+/// by size ranges. Granularity is 4K.
+struct LargePool
+{
+    uint largestFreeEstimate; // strictly >= largest free block, in bytes
+    uint pages; // number of pages in this pool
+    uint[BUCKETS] buckets; // index of the first free run
+    // offset serves double duty
+    // when pages are free it contains next in a free list
+    // else it is filled with offset of start of the object
+    uint* offsetTable; // one uint per page
+    // size of an object or a run of free pages, in 4k pages
+    uint* sizeTable; // one uint per page
+    BitArray markbits;
+    BitArray freebits;
+    NibbleArray attrs;
+
+}
+
+/// A "pool" that represents single huge allocation.
+/// All requests to realloc or extend are forwarded to
+/// respective OS primitives. Granularity is 1MB.
+struct HugePool
+{
+    bool mark;
+    bool finals;
+    bool structFinals;
+    bool appendable;
+}
+
 struct Pool
 {
     union Impl
@@ -116,11 +183,11 @@ nothrow:
     @property ref small(){ return impl.small; }
     @property ref large(){ return impl.large; }
     @property ref huge(){ return impl.huge; }
-    
+
     void initialize(size_t size)
     {
         _lock = shared(SpinLock)(SpinLock.Contention.medium);
-        isFree = false;
+        isFree = true;
         size_t CHUNKSIZE = (size + CHUNKSIZE-1) & ~(CHUNKSIZE-1);
         minAddr = cast(byte *)os_mem_map(CHUNKSIZE + CHUNKSIZE);
         mappedSize = CHUNKSIZE + CHUNKSIZE;
@@ -152,86 +219,296 @@ nothrow:
 
     void unlock(){ _lock.unlock(); }
 
-//TODO: implement the below
+//TODO: incapsulate tagged dispatch
 
-    uint getAttr(void* p){ return 0; }
-    
-    uint setAttr(void* p, uint attrs){ return 0; }
+    uint getAttr(void* p)
+    {
+        if (type == PoolType.SMALL) return getAttrSmall(p);
+        else if(type == PoolType.LARGE) return getAttrLarge(p);
+        else return getAttrHuge(p);
+    }
 
-    uint clrAttr(void* p, uint attrs){ return 0; }
+    uint setAttr(void* p, uint attrs)
+    {
+        if (type == PoolType.SMALL) return setAttrSmall(p, attrs);
+        else if(type == PoolType.LARGE) return setAttrLarge(p, attrs);
+        else return setAttrHuge(p, attrs);
+    }
+
+    uint clrAttr(void* p, uint attrs)
+    {
+        if (type == PoolType.SMALL) return clrAttrSmall(p, attrs);
+        else if(type == PoolType.LARGE) return clrAttrLarge(p, attrs);
+        else return clrAttrHuge(p, attrs);
+    }
 
     size_t sizeOf(void* p)
     {
-        return 0;
+        if (type == PoolType.SMALL) return sizeOfSmall(p);
+        else if(type == PoolType.LARGE) return sizeOfLarge(p);
+        else return sizeOfHuge(p);
     }
 
     void* addrOf(void* p)
     {
-        return null;
+        if (type == PoolType.SMALL) return addrOfSmall(p);
+        else if(type == PoolType.LARGE) return addrOfLarge(p);
+        else return addrOfHuge(p);
     }
 
     // uint.max means same bits
     BlkInfo tryExtend(void* p, size_t minSize, size_t maxSize, uint bits=uint.max)
     {
-        return BlkInfo.init;
+        if (type == PoolType.SMALL)
+            return tryExtendSmall(p, minSize, maxSize, bits);
+        else if(type == PoolType.LARGE)
+            return tryExtendLarge(p, minSize, maxSize, bits);
+        else
+            return tryExtendHuge(p, minSize, maxSize, bits);
     }
 
     BlkInfo query(void* p)
     {
-        return BlkInfo.init;
+        if (type == PoolType.SMALL) return querySmall(p);
+        else if(type == PoolType.LARGE) return queryLarge(p);
+        else return queryHuge(p);
     }
 
     void free(void* p)
     {
-
+        assert(type != PoolType.HUGE); // Huge is handled separately
+        if (type == PoolType.SMALL) return freeSmall(p);
+        else return freeLarge(p);
     }
 
     void runFinalizers(const void[] segment)
     {
-
+        // TODO
     }
-}
 
-/// Segregated pool with a single size class.
-/// Memory is allocated in bulk - 32 objects at a time.
-struct SmallPool
-{
-    uint freeObjects;
+// SMALL POOL implementations
+    uint getAttrSmall(void* p)
+    {
+        return 0;
+    }
 
-}
+    uint setAttrSmall(void* p, uint attrs)
+    {
+        return 0;
+    }
 
-/// A set of pages organized into a bunch of free lists
-/// by size ranges. Granularity is 4K.
-struct LargePool
-{
-    uint largestFreeEstimate; // strictly >= largest free block
-    uint pages; // number of pages in this pool
-    uint[BUCKETS] freeLists; // index of the first free run
-    // offset serves double duty
-    // when pages are free it contains next in a free list
-    // else it is filled with offset of start of the object
-    uint* offsetTable; // one uint per page
-    // size of an object or a run of free pages
-    uint* sizeTable; // one uint per page
-    BitArray markbits;
-    BitArray freebits;
-    NibbleArray attrs;
+    uint clrAttrSmall(void* p, uint attrs)
+    {
+        return 0;
+    }
 
-    BlkInfo allocate(size_t size, uint bits) nothrow
+    size_t sizeOfSmall(void* p)
+    {
+        return 0;
+    }
+
+    void* addrOfSmall(void* p)
+    {
+        return null;
+    }
+
+    // uint.max means same bits
+    BlkInfo tryExtendSmall(void* p, size_t minSize, size_t maxSize, uint bits=uint.max)
     {
         return BlkInfo.init;
     }
-}
 
-/// A "pool" that represents single huge allocation.
-/// All requests to realloc or extend are forwarded to 
-/// respective OS primitives. Granularity is 1MB.
-struct HugePool
-{
-    bool mark;
-    bool finals;
-    bool structFinals;
-    bool appendable;
+    BlkInfo querySmall(void* p)
+    {
+        return BlkInfo.init;
+    }
+
+    void freeSmall(void* p)
+    {
+        
+    }
+
+// LARGE POOL implementations
+
+    uint startOfLarge(void* p)
+    {
+        uint i = cast(uint)(p - minAddr) / PAGESIZE;
+        return large.offsetTable[i];
+    }
+
+    void putToFreeList(uint offset, uint psize)
+    {
+        ubyte bucket = bucketOf(psize * PAGESIZE);
+        large.offsetTable[offset] = large.buckets[bucket];
+        large.sizeTable[offset] = psize;
+        large.buckets[bucket] = offset;
+    }
+
+    BlkInfo allocateLarge(size_t size, uint bits)
+    {
+        assert(type == PoolType.LARGE);
+        ubyte bucket = bucketOf(size);
+        uint psize = cast(uint)(size + PAGESIZE-1) / PAGESIZE;
+
+        BlkInfo cutOut(uint start) nothrow
+        {
+            for (uint i = start; i < start + psize; i++)
+                large.offsetTable[i] = start;
+            large.sizeTable[start] = psize;
+            BlkInfo blk;
+            blk.base = minAddr + start*PAGESIZE;
+            blk.size = psize * PAGESIZE;
+            blk.attr = bits;
+            // TODO: set attr metadata
+            large.attrs[start] = attrToNibble(bits);
+            large.freebits[start..start+psize] = 0;
+            return blk;
+        }
+
+        uint head = large.buckets[bucket];
+        uint cur = head, prev = head;
+        while (cur != uint.max)
+        {
+            uint blockSize = large.sizeTable[cur];
+            if (blockSize >= psize)
+            {
+                if (cur == head) large.buckets[bucket] = large.offsetTable[cur];
+                else large.offsetTable[prev] = large.offsetTable[cur];
+                uint rem = blockSize - psize;
+                if (rem) putToFreeList(cur + psize, rem);
+                return cutOut(cur);
+            }
+            prev = cur;
+            cur = large.offsetTable[cur];
+        }
+        bucket++;
+        // search larger buckets
+        while (bucket < BUCKETS)
+        {
+            if (large.buckets[bucket] != uint.max)
+            {
+                uint s = large.buckets[bucket];
+                large.buckets[bucket] = large.offsetTable[s];
+                uint blockSize = large.sizeTable[s];
+                uint rem = blockSize - psize;
+                assert(rem > 0);
+                putToFreeList(s + psize, rem);
+                return cutOut(s);
+            }
+            bucket++;
+        }
+        // not found
+        return BlkInfo.init;
+    }
+
+    uint getAttrLarge(void* p)
+    {
+        uint s = startOfLarge(p);
+        return attrFromNibble(large.attrs[s], noScan);
+    }
+
+    uint setAttrLarge(void* p, uint attrs)
+    {
+        uint s = startOfLarge(p);
+        large.attrs[s] |= attrToNibble(attrs);
+        return attrFromNibble(large.attrs[s], noScan);
+    }
+
+    uint clrAttrLarge(void* p, uint attrs)
+    {
+        uint s = startOfLarge(p);
+        large.attrs[s] &= ~attrToNibble(attrs);
+        return attrFromNibble(large.attrs[s],noScan);
+    }
+
+    size_t sizeOfLarge(void* p)
+    {
+        uint s = startOfLarge(p);
+        return large.sizeTable[s];
+    }
+
+    void* addrOfLarge(void* p)
+    {
+        return minAddr + startOfLarge(p)*PAGESIZE;
+    }
+
+    // uint.max means same bits
+    BlkInfo tryExtendLarge(void* p, size_t minSize, size_t maxSize, uint bits=uint.max)
+    {
+        //TODO: check if followed by free space, extend + readd it from free lists
+        return BlkInfo.init;
+    }
+
+    BlkInfo queryLarge(void* p)
+    {
+        uint s = startOfLarge(p);
+        void* base = minAddr + s*PAGESIZE;
+        uint size = large.sizeTable[s]*PAGESIZE;
+        uint attrs = attrFromNibble(large.attrs[s], noScan);
+        return BlkInfo(base, size, attrs);
+    }
+
+
+    void freeLarge(void* p)
+    {
+        uint s = startOfLarge(p);
+        uint psize = large.sizeTable[s];
+        putToFreeList(s, psize);
+        large.attrs[s] = 0;
+        large.freebits[s..s+psize] = 1;
+    }
+
+// HUGE POOL implementations
+    uint getAttrHuge(void* p)
+    {
+        uint attrs;
+        if (huge.finals) attrs |= BlkAttr.FINALIZE;
+        if (huge.appendable) attrs |= BlkAttr.APPENDABLE;
+        if (huge.structFinals) attrs |= BlkAttr.STRUCTFINAL;
+        if (noScan) attrs |= BlkAttr.NO_SCAN;
+        return attrs;
+    }
+
+    uint setAttrHuge(void* p, uint attrs)
+    {
+        if (attrs & BlkAttr.FINALIZE) huge.finals = true;
+        if (attrs & BlkAttr.APPENDABLE) huge.appendable = true;
+        if (attrs & BlkAttr.STRUCTFINAL) huge.structFinals = true;
+        return getAttrHuge(p);
+    }
+
+    uint clrAttrHuge(void* p, uint attrs)
+    {
+        if (attrs & BlkAttr.FINALIZE) huge.finals = false;
+        if (attrs & BlkAttr.APPENDABLE) huge.appendable = false;
+        if (attrs & BlkAttr.STRUCTFINAL) huge.structFinals = false;
+        return getAttrHuge(p);
+    }
+
+    size_t sizeOfHuge(void* p)
+    {
+        return maxAddr - minAddr;
+    }
+
+    void* addrOfHuge(void* p)
+    {
+        return minAddr;
+    }
+
+    // uint.max means same bits
+    BlkInfo tryExtendHuge(void* p, size_t minSize, size_t maxSize, uint bits=uint.max)
+    {
+        //TODO: use mremap on *NIX
+        return BlkInfo.init;
+    }
+
+    BlkInfo queryHuge(void* p)
+    {
+        void* base = minAddr;
+        size_t size = maxAddr - minAddr;
+        uint attrs = getAttrHuge(p);
+        return BlkInfo(base, size, attrs);
+    }
 }
 
 Pool* newSmallPool(ubyte sizeClass, bool noScan) nothrow
@@ -254,14 +531,14 @@ Pool* newLargePool(size_t size, bool noScan) nothrow
     p.initialize(size);
     p.large.largestFreeEstimate = cast(uint)(p.maxAddr - p.minAddr);
     p.large.pages = cast(uint)(p.maxAddr - p.minAddr) / PAGESIZE;
-    p.large.freeLists[] = uint.max;
+    p.large.buckets[] = uint.max;
     p.large.offsetTable = cast(uint*)common.xmalloc(uint.sizeof * p.large.pages);
     p.large.sizeTable = cast(uint*)common.xmalloc(uint.sizeof * p.large.pages);
 
     // setup free lists as one big chunk of highest bucket
-    p.large.sizeTable[0] = p.large.largestFreeEstimate;
+    p.large.sizeTable[0] = (p.large.largestFreeEstimate + PAGESIZE-1) / PAGESIZE;
     p.large.offsetTable[0] = uint.max;
-    p.large.freeLists[BUCKETS-1] = 0;
+    p.large.buckets[BUCKETS-1] = 0;
     return p;
 }
 
@@ -271,9 +548,37 @@ Pool* newHugePool(size_t size, uint bits) nothrow
     p.type = PoolType.HUGE;
     p.shiftBy = 20;
     p.noScan = ((bits & BlkAttr.NO_SCAN) != 0);
+    p.initialize(size);
+    p.isFree = false;
     p.huge.finals = ((bits & BlkAttr.FINALIZE) != 0);
     p.huge.structFinals = ((bits & BlkAttr.STRUCTFINAL) != 0);
     p.huge.appendable = ((bits & BlkAttr.APPENDABLE) != 0);
-    p.initialize(size);
     return p;
+}
+
+
+unittest
+{
+    enum size = 12*CHUNKSIZE;
+    Pool* pool = newLargePool(size, true);
+    struct Link
+    {
+        Link* next;
+    }
+    Link* head = null;
+    for (size_t i = 0; i < size/PAGESIZE; i++)
+    {
+        BlkInfo blk = pool.allocateLarge(PAGESIZE, 0);
+        Link* n = cast(Link*)blk.base;
+        assert(blk.base);
+        assert(blk.size == PAGESIZE);
+        n.next = head;
+        head = n;
+    }
+    while(head.next)
+    {
+        Link* cur = head;
+        head = head.next;
+        pool.freeLarge(cur);
+    }
 }

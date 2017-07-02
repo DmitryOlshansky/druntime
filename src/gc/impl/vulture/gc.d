@@ -221,7 +221,7 @@ class VultureGC : GC
                 if (p.large.largestFreeEstimate >= size)
                 {
                     metaLock.unlock();
-                    auto blk = p.large.allocate(size, bits);
+                    auto blk = p.allocateLarge(size, bits);
                     p.unlock();
                     if (blk.base) return blk;
                     // estimate was wrong, continue
@@ -235,7 +235,7 @@ class VultureGC : GC
         numLargePools[noScan]++;
         metaLock.unlock();
         auto pool = newLargePool(poolSize, noScan);
-        auto blk = pool.large.allocate(size, bits); // no locking, nobody can see it
+        auto blk = pool.allocateLarge(size, bits); // no locking, nobody can see it
         metaLock.lock();
         poolTable.insert(pool);
         metaLock.unlock();
@@ -318,8 +318,17 @@ class VultureGC : GC
         metaLock.lock();
         Pool* pool = poolTable.lookup(p);
         if (!pool) return;
-        pool.lock();
+        if (pool.type == PoolType.HUGE)
+        {
+            pool.lock();
+            pool.isFree = true;
+            pool.unlock();
+            // TODO: just remove one pool
+            poolTable.minimize();
+            return;
+        }
         metaLock.unlock();
+        pool.lock();
         scope(exit) pool.unlock();
         return pool.free(p);
     }

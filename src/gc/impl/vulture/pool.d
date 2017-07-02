@@ -561,24 +561,33 @@ unittest
 {
     enum size = 12*CHUNKSIZE;
     Pool* pool = newLargePool(size, true);
-    struct Link
+    foreach_reverse(item; 1..1000)
     {
-        Link* next;
-    }
-    Link* head = null;
-    for (size_t i = 0; i < size/PAGESIZE; i++)
-    {
-        BlkInfo blk = pool.allocateLarge(PAGESIZE, 0);
-        Link* n = cast(Link*)blk.base;
-        assert(blk.base);
-        assert(blk.size == PAGESIZE);
-        n.next = head;
-        head = n;
-    }
-    while(head.next)
-    {
-        Link* cur = head;
-        head = head.next;
-        pool.freeLarge(cur);
+        size_t itemSize = item*PAGESIZE;
+        struct Link
+        {
+            Link* next;
+        }
+        Link* head = null;
+        size_t cnt = 0;
+        for(;;cnt++)
+        {
+            BlkInfo blk = pool.allocateLarge(itemSize, 0);
+            if (!blk.base) break;
+            Link* n = cast(Link*)blk.base;
+            assert(blk.base);
+            assert(blk.size == itemSize);
+            n.next = head;
+            head = n;
+        }
+        assert(cnt >= size/1000/PAGESIZE);
+        if (item == 1)
+            assert(cnt == size/PAGESIZE);
+        while(head)
+        {
+            Link* cur = head;
+            head = head.next;
+            pool.freeLarge(cur);
+        }
     }
 }

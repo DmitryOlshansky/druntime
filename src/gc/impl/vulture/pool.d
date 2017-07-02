@@ -15,7 +15,8 @@ enum
     PAGESIZE = 4096,
     CHUNKSIZE = 256 * PAGESIZE,
     MAXSMALL = 2048,
-    MAXLARGE = 8 * CHUNKSIZE
+    MAXLARGE = 8 * CHUNKSIZE, 
+    SMALL_RUN_SIZE = 1024 // must be power of 2
 }
 
 alias BlkInfo = core.memory.GC.BlkInfo;
@@ -84,17 +85,18 @@ ubyte bucketOf(size_t size) nothrow
     return bucket > BUCKETS-1 ? BUCKETS-1 : bucket;
 }
 
+struct AllocBatch
+{
+    Pool* pool;     // the pool where block was acquired
+    uint objOffset; // number of the first object in freeBits slice
+    uint freeBits;  // freebits with up to 32 objects
+}
+
 struct ThreadCache
 {
 nothrow:
-    struct AllocCache
-    {
-        Pool* pool;     // the pool where block was acquired
-        uint objOffset; // number of the first object in freeBits slice
-        uint freeBits;  // freebits with up to 32 objects
-    }
 
-    AllocCache[SIZE_CLASSES*2] cache; // per size class per SCAN/NO_SCAN
+    AllocBatch[SIZE_CLASSES*2] cache; // per size class per SCAN/NO_SCAN
 
     BlkInfo allocate(ubyte sclass, uint bits)
     {
@@ -127,8 +129,12 @@ unittest
 /// Memory is allocated in bulk - 32 objects at a time.
 struct SmallPool
 {
-    uint freeObjects;
-
+    uint freeObjects; // total free objects
+    uint runs; // memory is organized into runs of 1024 objects
+    uint* freeInRun; // count of free objects in each run
+    BitArray markbits; // granularity is per object
+    BitArray freebits; // granularity is per object
+    NibbleArray attrs; // granularity is per object
 }
 
 /// A set of pages organized into a bunch of free lists
@@ -220,7 +226,6 @@ nothrow:
     void unlock(){ _lock.unlock(); }
 
 //TODO: incapsulate tagged dispatch
-
     uint getAttr(void* p)
     {
         if (type == PoolType.SMALL) return getAttrSmall(p);
@@ -287,49 +292,84 @@ nothrow:
     }
 
 // SMALL POOL implementations
+    AllocBatch allocateBatchSmall()
+    {
+        foreach(uint i; 0..small.runs)
+        {
+            if (small.freeInRun[i] > 0)
+            {
+                uint start = i * SMALL_RUN_SIZE;
+                uint offset = small.freebits.scan32(start);
+                // found first non-zero 32 bits
+                uint freeBits = small.freebits.read32(offset);
+                small.freebits.write32(0, offset);
+                return AllocBatch(&this, offset, freeBits);            
+            }
+        }
+        return AllocBatch.init;
+    }
+
     uint getAttrSmall(void* p)
     {
-        return 0;
+        uint offset = cast(uint)(p - minAddr)>>shiftBy;
+        return attrFromNibble(small.attrs[offset], noScan);
     }
 
     uint setAttrSmall(void* p, uint attrs)
     {
-        return 0;
+        uint offset = cast(uint)(p - minAddr)>>shiftBy;
+        small.attrs[offset] |= attrToNibble(attrs);
+        return attrFromNibble(small.attrs[offset], noScan);
     }
 
     uint clrAttrSmall(void* p, uint attrs)
     {
-        return 0;
+        uint offset = cast(uint)(p - minAddr)>>shiftBy;
+        small.attrs[offset] &= ~attrToNibble(attrs);
+        return attrFromNibble(small.attrs[offset], noScan);
     }
 
     size_t sizeOfSmall(void* p)
     {
-        return 0;
+        return 1<<shiftBy;
     }
 
     void* addrOfSmall(void* p)
     {
-        return null;
+        auto roundedDown = cast(size_t)p & ~((1<<shiftBy)-1);
+        return cast(void*)roundedDown;
     }
 
     // uint.max means same bits
     BlkInfo tryExtendSmall(void* p, size_t minSize, size_t maxSize, uint bits=uint.max)
     {
+        size_t ourSize = (1<<shiftBy);
+        if (minSize < ourSize)
+        {
+            size_t newSize = ourSize > maxSize ? maxSize : ourSize;
+            uint offset = cast(uint)(p - minAddr)>>shiftBy;
+            if (bits != uint.max)
+                small.attrs[offset] = attrToNibble(bits);
+            return BlkInfo(p, newSize, attrFromNibble(small.attrs[offset], noScan));
+        }
         return BlkInfo.init;
     }
 
     BlkInfo querySmall(void* p)
     {
-        return BlkInfo.init;
+        void* base = addrOfSmall(p);
+        uint offset = cast(uint)(p - minAddr)>>shiftBy;
+        return BlkInfo(base, 1<<shiftBy, attrFromNibble(small.attrs[offset], noScan));
     }
 
     void freeSmall(void* p)
     {
-        
+        uint offset = cast(uint)(p - minAddr)>>shiftBy;
+        small.freebits[offset] = 1;
+        small.attrs[offset] = 0;
     }
 
 // LARGE POOL implementations
-
     uint startOfLarge(void* p)
     {
         uint i = cast(uint)(p - minAddr) / PAGESIZE;
@@ -448,7 +488,6 @@ nothrow:
         return BlkInfo(base, size, attrs);
     }
 
-
     void freeLarge(void* p)
     {
         uint s = startOfLarge(p);
@@ -518,7 +557,12 @@ Pool* newSmallPool(ubyte sizeClass, bool noScan) nothrow
     p.noScan = noScan;
     p.shiftBy = sizeClass;
     p.initialize((sizeClass-FIRST_SIZE_CLASS+1) * CHUNKSIZE);
-    //TODO: proper init
+    uint objects = cast(uint)(p.maxAddr - p.minAddr)>>sizeClass;
+    p.small.freeObjects = objects;
+    p.small.runs  = objects / SMALL_RUN_SIZE;
+    p.small.freeInRun = cast(uint*)common.xmalloc(uint.sizeof*p.small.runs);
+    p.small.freeInRun[0..p.small.runs] = SMALL_RUN_SIZE;
+    //TODO: allocate bits and nibbles
     return p;
 }
 
@@ -534,6 +578,7 @@ Pool* newLargePool(size_t size, bool noScan) nothrow
     p.large.buckets[] = uint.max;
     p.large.offsetTable = cast(uint*)common.xmalloc(uint.sizeof * p.large.pages);
     p.large.sizeTable = cast(uint*)common.xmalloc(uint.sizeof * p.large.pages);
+    //TODO: allocate bits and nibbles
 
     // setup free lists as one big chunk of highest bucket
     p.large.sizeTable[0] = (p.large.largestFreeEstimate + PAGESIZE-1) / PAGESIZE;
@@ -554,6 +599,12 @@ Pool* newHugePool(size_t size, uint bits) nothrow
     p.huge.structFinals = ((bits & BlkAttr.STRUCTFINAL) != 0);
     p.huge.appendable = ((bits & BlkAttr.APPENDABLE) != 0);
     return p;
+}
+
+unittest
+{
+    Pool* pool = newSmallPool(5, true);
+
 }
 
 

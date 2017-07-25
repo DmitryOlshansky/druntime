@@ -292,17 +292,18 @@ nothrow:
     }
 
 // SMALL POOL implementations
-    AllocBatch allocateBatchSmall()
+    AllocBatch allocateBatchSmall() return
     {
         foreach(uint i; 0..small.runs)
         {
             if (small.freeInRun[i] > 0)
             {
                 uint start = i * SMALL_RUN_SIZE;
+                // find first non-zero 32 bits
                 uint offset = small.freebits.scan32(start);
-                // found first non-zero 32 bits
                 uint freeBits = small.freebits.read32(offset);
                 small.freebits.write32(0, offset);
+                small.freeInRun[i] -= popcnt(freeBits);
                 return AllocBatch(&this, offset, freeBits);            
             }
         }
